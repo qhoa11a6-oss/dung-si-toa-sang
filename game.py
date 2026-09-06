@@ -48,6 +48,28 @@ VIDEO_HEIGHT = 520
 # ============================================================
 # CƠ SỞ DỮ LIỆU & KHO MINH CHỨNG
 # ============================================================
+#
+# ƯU TIÊN: Supabase (lưu lâu dài trên cloud)
+# FALLBACK: SQLite + uploads cục bộ để cô vẫn chạy thử được trên máy.
+#
+# Khi đưa lên Streamlit Cloud, cô chỉ cần cấu hình:
+# SUPABASE_URL, SUPABASE_KEY, SUPABASE_BUCKET trong Secrets.
+# ============================================================
+
+import requests
+from urllib.parse import quote
+
+try:
+    SUPABASE_URL = st.secrets.get("SUPABASE_URL", "").rstrip("/")
+    SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
+    SUPABASE_BUCKET = st.secrets.get("SUPABASE_BUCKET", "game-media")
+except Exception:
+    SUPABASE_URL = ""
+    SUPABASE_KEY = ""
+    SUPABASE_BUCKET = "game-media"
+
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
+
 
 def db_connect():
     conn = sqlite3.connect(DB_PATH)
@@ -56,6 +78,7 @@ def db_connect():
 
 
 def init_database():
+    """SQLite fallback. Supabase được tạo bằng SQL trong file hướng dẫn."""
     with db_connect() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS players (
@@ -64,11 +87,17 @@ def init_database():
                 lop TEXT NOT NULL,
                 gender TEXT NOT NULL,
                 stars INTEGER NOT NULL DEFAULT 0,
+                boss_defeated INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 last_seen TEXT NOT NULL,
                 UNIQUE(name COLLATE NOCASE, lop COLLATE NOCASE)
             )
         """)
+        # Nâng cấp DB cũ nếu cô đã có file SQLite từ phiên bản trước.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(players)").fetchall()}
+        if "boss_defeated" not in cols:
+            conn.execute("ALTER TABLE players ADD COLUMN boss_defeated INTEGER NOT NULL DEFAULT 0")
+
         conn.execute("""
             CREATE TABLE IF NOT EXISTS submissions (
                 id TEXT PRIMARY KEY,
@@ -89,6 +118,38 @@ def init_database():
         conn.commit()
 
 
+def supabase_headers(prefer=None, content_type=None):
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    if content_type:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def supabase_rest(table, method="GET", params=None, payload=None, prefer=None):
+    url = f"{SUPABASE_URL}/rest/v1/{table}"
+    try:
+        r = requests.request(
+            method,
+            url,
+            headers=supabase_headers(prefer=prefer, content_type="application/json" if payload is not None else None),
+            params=params,
+            json=payload,
+            timeout=30,
+        )
+        if not r.ok:
+            raise RuntimeError(f"Supabase {method} {table}: {r.status_code} - {r.text[:500]}")
+        if not r.text:
+            return []
+        return r.json()
+    except Exception as e:
+        raise RuntimeError(str(e)) from e
+
+
 def now_text():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -96,6 +157,42 @@ def now_text():
 def get_or_create_player(name, lop, gender):
     name = name.strip()
     lop = lop.strip()
+    ts = now_text()
+
+    if USE_SUPABASE:
+        rows = supabase_rest(
+            "players",
+            params={"select": "*", "limit": "1000"},
+        )
+        row = next(
+            (r for r in rows if r.get("name", "").strip().casefold() == name.casefold()
+             and r.get("lop", "").strip().casefold() == lop.casefold()),
+            None,
+        )
+        if row:
+            updated = supabase_rest(
+                "players",
+                method="PATCH",
+                params={"id": f"eq.{row['id']}"},
+                payload={"gender": gender, "last_seen": ts},
+                prefer="return=representation",
+            )
+            return updated[0] if updated else row | {"gender": gender, "last_seen": ts}
+
+        player_id = uuid.uuid4().hex
+        payload = {
+            "id": player_id,
+            "name": name,
+            "lop": lop,
+            "gender": gender,
+            "stars": 0,
+            "boss_defeated": False,
+            "created_at": ts,
+            "last_seen": ts,
+        }
+        rows = supabase_rest("players", method="POST", payload=payload, prefer="return=representation")
+        return rows[0]
+
     with db_connect() as conn:
         row = conn.execute(
             "SELECT * FROM players WHERE lower(name)=lower(?) AND lower(lop)=lower(?)",
@@ -104,14 +201,14 @@ def get_or_create_player(name, lop, gender):
         if row:
             conn.execute(
                 "UPDATE players SET gender=?, last_seen=? WHERE id=?",
-                (gender, now_text(), row["id"]),
+                (gender, ts, row["id"]),
             )
-            return dict(row) | {"gender": gender, "last_seen": now_text()}
+            conn.commit()
+            return dict(row) | {"gender": gender, "last_seen": ts}
 
         player_id = uuid.uuid4().hex
-        ts = now_text()
         conn.execute(
-            "INSERT INTO players(id,name,lop,gender,stars,created_at,last_seen) VALUES(?,?,?,?,0,?,?)",
+            "INSERT INTO players(id,name,lop,gender,stars,boss_defeated,created_at,last_seen) VALUES(?,?,?,?,0,0,?,?)",
             (player_id, name, lop, gender, ts, ts),
         )
         conn.commit()
@@ -120,12 +217,39 @@ def get_or_create_player(name, lop, gender):
 
 
 def update_player_stars(player_id, stars):
+    ts = now_text()
+    if USE_SUPABASE:
+        supabase_rest(
+            "players",
+            method="PATCH",
+            params={"id": f"eq.{player_id}"},
+            payload={"stars": int(stars), "last_seen": ts},
+        )
+        return
     with db_connect() as conn:
-        conn.execute("UPDATE players SET stars=?, last_seen=? WHERE id=?", (int(stars), now_text(), player_id))
+        conn.execute("UPDATE players SET stars=?, last_seen=? WHERE id=?", (int(stars), ts, player_id))
+        conn.commit()
+
+
+def update_player_boss(player_id, defeated=True):
+    ts = now_text()
+    if USE_SUPABASE:
+        supabase_rest(
+            "players",
+            method="PATCH",
+            params={"id": f"eq.{player_id}"},
+            payload={"boss_defeated": bool(defeated), "last_seen": ts},
+        )
+        return
+    with db_connect() as conn:
+        conn.execute("UPDATE players SET boss_defeated=?, last_seen=? WHERE id=?", (1 if defeated else 0, ts, player_id))
         conn.commit()
 
 
 def load_player(player_id):
+    if USE_SUPABASE:
+        rows = supabase_rest("players", params={"select": "*", "id": f"eq.{player_id}", "limit": "1"})
+        return rows[0] if rows else None
     with db_connect() as conn:
         row = conn.execute("SELECT * FROM players WHERE id=?", (player_id,)).fetchone()
     return dict(row) if row else None
@@ -133,6 +257,18 @@ def load_player(player_id):
 
 def load_today_submissions(player_id):
     today_prefix = str(date.today())
+    if USE_SUPABASE:
+        rows = supabase_rest(
+            "submissions",
+            params={
+                "select": "*",
+                "player_id": f"eq.{player_id}",
+                "submitted_at": f"gte.{today_prefix} 00:00:00",
+                "order": "submitted_at.desc",
+                "limit": "1000",
+            },
+        )
+        return rows
     with db_connect() as conn:
         rows = conn.execute(
             "SELECT * FROM submissions WHERE player_id=? AND submitted_at LIKE ? ORDER BY submitted_at DESC",
@@ -141,16 +277,81 @@ def load_today_submissions(player_id):
     return [dict(r) for r in rows]
 
 
+def upload_to_supabase(storage_path, file_bytes, content_type):
+    url = f"{SUPABASE_URL}/storage/v1/object/{quote(SUPABASE_BUCKET, safe='')}/{quote(storage_path, safe='/')}"
+    headers = supabase_headers()
+    headers["Content-Type"] = content_type or "application/octet-stream"
+    headers["x-upsert"] = "false"
+    r = requests.post(url, headers=headers, data=file_bytes, timeout=120)
+    if not r.ok:
+        raise RuntimeError(f"Không tải được minh chứng lên Supabase Storage: {r.status_code} - {r.text[:500]}")
+
+
+def get_signed_media_url(storage_path, expires=3600):
+    if not USE_SUPABASE:
+        return None
+    url = f"{SUPABASE_URL}/storage/v1/object/sign/{quote(SUPABASE_BUCKET, safe='')}/{quote(storage_path, safe='/')}"
+    r = requests.post(
+        url,
+        headers=supabase_headers(content_type="application/json"),
+        json={"expiresIn": expires},
+        timeout=30,
+    )
+    if not r.ok:
+        return None
+    data = r.json()
+    signed = data.get("signedURL") or data.get("signedUrl")
+    if not signed:
+        return None
+    if signed.startswith("http"):
+        return signed
+    return f"{SUPABASE_URL}/storage/v1{signed}"
+
+
 def save_submission(player_id, task, uploaded_file, parent_note):
     suffix = Path(uploaded_file.name).suffix.lower()
-    safe_name = f"{uuid.uuid4().hex}{suffix}"
-    day_dir = UPLOAD_DIR / str(date.today())
-    day_dir.mkdir(parents=True, exist_ok=True)
-    target = day_dir / safe_name
-    target.write_bytes(uploaded_file.getvalue())
-
     media_type = "video" if suffix in VIDEO_EXTS else "image"
     submission_id = uuid.uuid4().hex
+    ts = now_text()
+    file_bytes = uploaded_file.getvalue()
+
+    if USE_SUPABASE:
+        storage_path = f"{date.today()}/{player_id}/{submission_id}{suffix}"
+        content_type = getattr(uploaded_file, "type", None) or ("video/mp4" if media_type == "video" else "image/jpeg")
+        upload_to_supabase(storage_path, file_bytes, content_type)
+        media_path = storage_path
+
+        payload = {
+            "id": submission_id,
+            "player_id": player_id,
+            "task_id": task["id"],
+            "task_title": task["title"],
+            "media_type": media_type,
+            "original_filename": uploaded_file.name,
+            "media_path": media_path,
+            "parent_note": parent_note.strip(),
+            "submitted_at": ts,
+            "reward": task["reward"],
+        }
+        rows = supabase_rest("submissions", method="POST", payload=payload, prefer="return=representation")
+        update_player_stars(player_id, (load_player(player_id) or {}).get("stars", 0) + task["reward"])
+        return {
+            "id": submission_id,
+            "task_id": task["id"],
+            "media_type": media_type,
+            "filename": uploaded_file.name,
+            "path": media_path,
+            "media_url": get_signed_media_url(media_path),
+            "parent_note": parent_note.strip(),
+            "submitted_at": ts,
+        }
+
+    day_dir = UPLOAD_DIR / str(date.today())
+    day_dir.mkdir(parents=True, exist_ok=True)
+    safe_name = f"{submission_id}{suffix}"
+    target = day_dir / safe_name
+    target.write_bytes(file_bytes)
+
     with db_connect() as conn:
         conn.execute(
             """
@@ -168,13 +369,13 @@ def save_submission(player_id, task, uploaded_file, parent_note):
                 uploaded_file.name,
                 str(target),
                 parent_note.strip(),
-                now_text(),
+                ts,
                 task["reward"],
             ),
         )
         conn.execute(
             "UPDATE players SET stars=stars+?, last_seen=? WHERE id=?",
-            (task["reward"], now_text(), player_id),
+            (task["reward"], ts, player_id),
         )
         conn.commit()
 
@@ -185,17 +386,34 @@ def save_submission(player_id, task, uploaded_file, parent_note):
         "filename": uploaded_file.name,
         "path": str(target),
         "parent_note": parent_note.strip(),
-        "submitted_at": now_text(),
+        "submitted_at": ts,
     }
 
 
 def load_all_players():
+    if USE_SUPABASE:
+        return supabase_rest("players", params={"select": "*", "order": "last_seen.desc", "limit": "5000"})
     with db_connect() as conn:
         rows = conn.execute("SELECT * FROM players ORDER BY last_seen DESC").fetchall()
     return [dict(r) for r in rows]
 
 
 def load_all_submissions(player_id=None, class_name=None):
+    if USE_SUPABASE:
+        rows = supabase_rest("submissions", params={"select": "*", "order": "submitted_at.desc", "limit": "10000"})
+        players = {p["id"]: p for p in load_all_players()}
+        result = []
+        for s in rows:
+            p = players.get(s.get("player_id"), {})
+            if player_id and s.get("player_id") != player_id:
+                continue
+            if class_name and class_name != "Tất cả" and p.get("lop") != class_name:
+                continue
+            item = dict(s)
+            item.update({"name": p.get("name", ""), "lop": p.get("lop", ""), "gender": p.get("gender", "")})
+            result.append(item)
+        return result
+
     query = """
         SELECT s.*, p.name, p.lop, p.gender
         FROM submissions s
@@ -215,7 +433,10 @@ def load_all_submissions(player_id=None, class_name=None):
     return [dict(r) for r in rows]
 
 
-init_database()
+# Chỉ tạo SQLite khi không dùng Supabase.
+if not USE_SUPABASE:
+    init_database()
+
 IMAGE_EXTS = [".png", ".jpg", ".jpeg", ".webp", ".gif"]
 VIDEO_EXTS = [".mp4", ".webm", ".mov"]
 
@@ -294,6 +515,7 @@ if st.session_state.player_id:
         st.session_state.name = saved_player["name"]
         st.session_state.lop = saved_player["lop"]
         st.session_state.gender = saved_player["gender"]
+        st.session_state.boss_defeated = bool(saved_player.get("boss_defeated", False))
 
 if st.session_state.last_day != TODAY:
     st.session_state.completed_tasks = []
@@ -727,12 +949,14 @@ with st.sidebar:
                 st.session_state.lop = player["lop"]
                 st.session_state.gender = player["gender"]
                 st.session_state.stars = player["stars"]
+                st.session_state.boss_defeated = bool(player.get("boss_defeated", False))
                 todays = load_today_submissions(player["id"])
                 st.session_state.completed_tasks = list(dict.fromkeys([r["task_id"] for r in todays]))
                 st.session_state.proofs = {
                     r["task_id"]: {
                         "filename": r["original_filename"],
                         "path": r["media_path"],
+                        "media_url": get_signed_media_url(r["media_path"]) if USE_SUPABASE else None,
                         "media_type": r["media_type"],
                         "parent_note": r["parent_note"],
                         "submitted_at": r["submitted_at"],
@@ -835,6 +1059,11 @@ if st.session_state.admin_mode:
     m3.metric("📸🎥 Lượt nộp minh chứng", total_submissions)
     m4.metric("⭐ Tổng EXP", total_exp)
 
+    if USE_SUPABASE:
+        st.success("☁️ KHO DỮ LIỆU ĐANG LƯU TRÊN SUPABASE — lịch sử học sinh và minh chứng được giữ lại qua các ngày.")
+    else:
+        st.warning("💾 Đang chạy chế độ lưu cục bộ SQLite. Khi đưa lên Streamlit Cloud, hãy cấu hình Supabase Secrets để dữ liệu không mất khi ứng dụng khởi động lại.")
+
     st.markdown("### 📋 DANH SÁCH DŨNG SĨ")
     class_options = ["Tất cả"] + sorted({p["lop"] for p in players})
     selected_class = st.selectbox("🏰 Lọc theo lớp", class_options)
@@ -860,6 +1089,7 @@ if st.session_state.admin_mode:
         st.info("Chưa có Dũng sĩ nào tham gia.")
 
     st.markdown("### 📷🎥 NHẬT KÝ MINH CHỨNG")
+    st.caption("📚 Hiển thị toàn bộ minh chứng đã nộp từ trước đến nay; không giới hạn theo ngày.")
     filtered_submissions = load_all_submissions(class_name=selected_class)
     if filtered_submissions:
         for sub in filtered_submissions:
@@ -874,25 +1104,47 @@ if st.session_state.admin_mode:
                     st.info(f"📜 Xác nhận Bố/Mẹ: {sub['parent_note']}")
                     st.caption(f"📎 Tệp: {sub['original_filename']}")
                 with c2:
-                    media_path = Path(sub["media_path"])
-                    if media_path.exists():
-                        if sub["media_type"] == "video":
-                            st.video(str(media_path))
+                    if USE_SUPABASE:
+                        media_url = get_signed_media_url(sub["media_path"])
+                        if media_url:
+                            if sub["media_type"] == "video":
+                                st.video(media_url)
+                            else:
+                                st.image(media_url, use_container_width=True)
+                            try:
+                                media_response = requests.get(media_url, timeout=120)
+                                media_response.raise_for_status()
+                                st.download_button(
+                                    "⬇️ Tải minh chứng",
+                                    data=media_response.content,
+                                    file_name=sub["original_filename"],
+                                    key=f"download_{sub['id']}",
+                                    use_container_width=True,
+                                )
+                            except Exception:
+                                st.warning("Không tải được tệp minh chứng từ kho cloud.")
                         else:
-                            st.image(str(media_path), use_container_width=True)
-                        try:
-                            data = media_path.read_bytes()
-                            st.download_button(
-                                "⬇️ Tải minh chứng",
-                                data=data,
-                                file_name=sub["original_filename"],
-                                key=f"download_{sub['id']}",
-                                use_container_width=True,
-                            )
-                        except OSError:
-                            st.warning("Không đọc được tệp minh chứng.")
+                            st.error("⚠️ Không tạo được liên kết xem minh chứng.")
                     else:
-                        st.error("⚠️ Tệp đã không còn trong kho lưu trữ.")
+                        media_path = Path(sub["media_path"])
+                        if media_path.exists():
+                            if sub["media_type"] == "video":
+                                st.video(str(media_path))
+                            else:
+                                st.image(str(media_path), use_container_width=True)
+                            try:
+                                data = media_path.read_bytes()
+                                st.download_button(
+                                    "⬇️ Tải minh chứng",
+                                    data=data,
+                                    file_name=sub["original_filename"],
+                                    key=f"download_{sub['id']}",
+                                    use_container_width=True,
+                                )
+                            except OSError:
+                                st.warning("Không đọc được tệp minh chứng.")
+                        else:
+                            st.error("⚠️ Tệp đã không còn trong kho lưu trữ.")
     else:
         st.info("Chưa có ảnh/video minh chứng nào theo bộ lọc hiện tại.")
 
@@ -1015,13 +1267,19 @@ for col, task in zip(task_cols, TASKS):
                 st.success("✅ ĐÃ GIAO BẢN HỢP ĐỒNG")
                 proof = st.session_state.proofs.get(task["id"])
                 if proof:
-                    proof_path = Path(proof.get("path", ""))
-                    if proof.get("media_type") == "video" and proof_path.exists():
-                        st.video(str(proof_path))
-                    elif proof_path.exists():
-                        st.image(str(proof_path), width=280)
-                    elif proof.get("data"):
-                        st.image(proof["data"], width=280)
+                    if USE_SUPABASE and proof.get("media_url"):
+                        if proof.get("media_type") == "video":
+                            st.video(proof["media_url"])
+                        else:
+                            st.image(proof["media_url"], width=280)
+                    else:
+                        proof_path = Path(proof.get("path", ""))
+                        if proof.get("media_type") == "video" and proof_path.exists():
+                            st.video(str(proof_path))
+                        elif proof_path.exists():
+                            st.image(str(proof_path), width=280)
+                        elif proof.get("data"):
+                            st.image(proof["data"], width=280)
                     if proof.get("parent_note"):
                         st.info(f"📜 Ấn tín của gia đình: {proof['parent_note']}")
                     if proof.get("submitted_at"):
@@ -1119,8 +1377,9 @@ with st.container(border=True):
 
         if st.session_state.stars >= 1500:
             st.success("🎯 ĐÃ ĐỦ 1.500 EXP! THANH GƯƠM ÁNH SÁNG ĐÃ SẴN SÀNG!")
-            if st.button("⚔️ THIỂN TRIỂN TUYỆT CHIÊU CUỐI CÙNG!", use_container_width=True):
+            if st.button("⚔️ TRIỂN KHAI TUYỆT CHIÊU CUỐI CÙNG!", use_container_width=True):
                 st.session_state.boss_defeated = True
+                update_player_boss(st.session_state.player_id, True)
                 st.session_state.show_victory = True
                 st.rerun()
         else:
